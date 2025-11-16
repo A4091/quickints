@@ -90,7 +90,9 @@ quickints
 ```
 
 Expected output:
-![Alt text](quickints.png?raw=true "Expected output")
+
+
+![Screenshot](quickints.png?raw=true "Expected output")
 
 
 ```
