@@ -12,7 +12,6 @@
 // Global to cache BadQuickInt value
 static __used ULONG BadQuickInt = 0;
 static __used BOOL BadQuickIntFound = FALSE;
-static __used APTR quickvec_param = NULL;
 
 ULONG __stdargs GetQuickVec();
 ULONG __stdargs ReleaseVec();
@@ -27,8 +26,7 @@ ULONG __stdargs ReleaseVec();
 ULONG __stdargs ObtainQuickVector(APTR vector)
 {
     ULONG vectorNum;
-
-    quickvec_param = vector;
+    asm volatile("move.l %0,d2" : : "g" (vector) : "d2");
     vectorNum = Supervisor(GetQuickVec);
 
     // Pass vector via register a0 and call supervisor
@@ -36,8 +34,8 @@ ULONG __stdargs ObtainQuickVector(APTR vector)
         "       bra 1f                         \n"
         "       .globl _GetQuickVec            \n"
         "_GetQuickVec:                         \n"
-        "       movem.l d1-d5/a0-a3,-(sp)      \n"
-        "       move.l  _quickvec_param,a0     \n" // Put vector parameter in a0
+        "       move.l  d2,a0                  \n"
+        "       movem.l d1-d5/a1-a3,-(sp)      \n"
         "       sub.l   a1,a1                  \n" // Clear a1 (assume VBR=0)
         "       or.w    #0x0700,sr             \n"
         "       btst    #0,(296+1)(a6)         \n" // AFB_68010 in AttnFlags+1
@@ -100,12 +98,12 @@ ULONG __stdargs ObtainQuickVector(APTR vector)
         "       bcs.s   .NoVector              \n"
 
         "       move.l  a0,(a2)                \n" // Store the vector
-        "       movem.l (sp)+,d1-d5/a0-a3      \n"
+        "       movem.l (sp)+,d1-d5/a1-a3      \n"
         "       rte                            \n" // Return with vector number in d0
 
         ".NoVector:                            \n"
         "       moveq   #0,d0                  \n" // Return failure
-        "       movem.l (sp)+,d1-d5/a0-a3      \n"
+        "       movem.l (sp)+,d1-d5/a1-a3      \n"
         "       rte                            \n"
         "1:                                    \n"
         : // No outputs
