@@ -26,6 +26,7 @@ extern VOID  __stdargs QuickHandler(VOID);
 #define BIT(x)        (uint32_t)(1 << (x))
 
 // ----------  NCR 53c710 registers ----------
+#define REG_SIEN    0x00  // SCSI interrupt enable
 #define REG_SCID    0x07  // SCSI chip ID
 
 #define REG_SSTAT0  0x0e  // SCSI status 0
@@ -64,24 +65,45 @@ extern VOID  __stdargs QuickHandler(VOID);
 #define REG_DMODE_BLE3  (BIT(6) | BIT(7))  // Burst length 8-transfers
 #define REG_DMODE_FC2   BIT(5)  // Value driven on FC2 when bus mastering
 
-static volatile ULONG qcount = 0;
-static volatile uint8_t *a4091_reg_base = NULL;
+typedef struct {
+	ULONG intcount;
+	volatile uint8_t *reg_addr;
+	volatile uint8_t *base_addr;
+	//
+	uint8_t ireg_istat;
+	uint8_t ireg_dstat;
+	uint8_t ireg_sien;
+	uint8_t ireg_sstat0;
+} state_t;
+
+state_t g_state = { 0, NULL, 0, 0, 0, 0 };
+
+static void
+set_ncrreg8_noglob(volatile uint8_t *a4091_regs, uint reg, uint8_t value)
+{
+    *ADDR8(a4091_regs + 0x40 + reg) = value;
+}
+
+static uint8_t
+get_ncrreg8_noglob(volatile uint8_t *a4091_regs, uint reg)
+{
+    uint8_t value;
+    value = *ADDR8(a4091_regs + reg);
+    return (value);
+}
 
 static void
 set_ncrreg8(uint reg, uint8_t value)
 {
-    volatile uint8_t * a4091_regs = a4091_reg_base + A4091_OFFSET_REGISTERS;
-    *ADDR8(a4091_regs + 0x40 + reg) = value;
+    set_ncrreg8_noglob(g_state.reg_addr, reg, value);
 }
 
 static uint8_t
 get_ncrreg8(uint reg)
 {
-    volatile uint8_t * a4091_regs = a4091_reg_base + A4091_OFFSET_REGISTERS;
-    uint8_t value;
-    value = *ADDR8(a4091_regs + reg);
-    return (value);
+    return get_ncrreg8_noglob(g_state.reg_addr, reg);
 }
+
 
 /*
  * a4091_reset
@@ -178,6 +200,38 @@ dma_clear_istat(void)
     return (0);
 }
 
+
+LONG
+quick_irq_handler(register state_t *save asm("a1"))
+{
+    uint8_t istat = get_ncrreg8_noglob(save->reg_addr, REG_ISTAT);
+    volatile uint8_t dstat;
+
+    if (istat & REG_ISTAT_ABRT)
+        set_ncrreg8_noglob(save->reg_addr, REG_ISTAT, 0);
+
+    /* Always read DSTAT to clear DMA interrupt source */
+    dstat = get_ncrreg8_noglob(save->reg_addr, REG_DSTAT);
+    if ((istat & (REG_ISTAT_DIP | REG_ISTAT_SIP)) != 0) {
+        uint prev_istat = save->ireg_istat;
+        /*
+         * ISTAT_SIP is set, read SSTAT0 register to determine cause
+         * If ISTAT_DIP is set, read DSTAT register to determine cause
+        */
+	save->ireg_istat  = istat;
+	save->ireg_sien   = get_ncrreg8_noglob(save->reg_addr, REG_SIEN);
+	save->ireg_sstat0 = get_ncrreg8_noglob(save->reg_addr, REG_SSTAT0);
+        save->ireg_dstat = dstat;
+
+        save->intcount++;
+
+        if (prev_istat == 0)
+	    return 1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     ULONG vec;
@@ -198,47 +252,33 @@ int main(void)
         return 1;
     }
 
-    a4091_reg_base = cdev->cd_BoardAddr;
-    printf("A4091/A4092 card at 0x%08lx\n", (ULONG)a4091_reg_base);
+    g_state.base_addr = cdev->cd_BoardAddr;
+    g_state.reg_addr = cdev->cd_BoardAddr + A4091_OFFSET_REGISTERS;
+    printf("A4091/A4092 card at 0x%08lx\n", (ULONG)g_state.base_addr);
 
     printf("Installing quick interrupt handler @0x%08lx...\n", (ULONG)QuickHandler);
 
     /* Naked quick-interrupt handler:
-       - Increments qcount
+       - Checks for real quick-interrupt
+       - Calls C interrupt handler
        - Returns with RTE (required for vectors)
      */
     asm volatile(
 	"    bra 1f			\n"
         "   .globl _QuickHandler	\n"
 	"_QuickHandler:			\n"
-	"    move.l d0,-(sp)            \n"
-	"    move.w 0xdff01c,d0		\n" // Interrupt Enable State
-	"    btst.l #14,d0		\n" // Check if pending disable
-	"    bne.s RealInterrupt	\n"
+	"    move.l  d0,-(sp)           \n"
+	"    move.w  0xdff01c,d0	\n" // Interrupt Enable State
+	"    btst.l  #14,d0		\n" // Check if pending disable
+	"    bne.s   RealInterrupt	\n"
 	"ExitInt:			\n"
-	"    move.l (sp)+,d0		\n"
+	"    move.l  (sp)+,d0		\n"
 	"    rte			\n"
         "RealInterrupt:			\n"
-        "    movem.l d1/a0-a1,-(sp)	\n"
-        "    lea _qcount,a0		\n" /* a0 = &qcount */
-        "    addq.l #1,(a0)		\n" /* ++qcount */
-	"    move.w  #0x0f0c,0xdff180	\n"  /* Set background color */
-
-        /* Clear A4091 interrupt source */
-        "    move.l _a4091_reg_base,a1   \n"
-        "    add.l  #0x00800000,a1       \n"  /* A4091_OFFSET_REGISTERS */
-
-        /* Read ISTAT to check interrupt cause */
-        "    move.b 0x22(a1),d1         \n"  /* REG_ISTAT */
-        "    btst   #7,d1               \n"  /* Check ABRT bit */
-        "    beq.s  3f                  \n"
-        "    move.b #0,0x62(a1)         \n"  /* Clear ISTAT via write port (0x40+0x22) */
-        "3:                            \n"
-
-        /* Clear DMA interrupt by reading DSTAT */
-        "    move.b 0x0f(a1),d1         \n"  /* Read REG_DSTAT to clear */
-
-        "    movem.l (sp)+,d1/a0-a1	\n"
+	"    movem.l d1-d7/a0-a6,-(sp)  \n"
+	"    lea     _g_state,a1        \n"
+	"    jsr     _quick_irq_handler \n"
+	"    movem.l (sp)+,d1-d7/a0-a6  \n"
         "    bra.s ExitInt		\n"
 	"1:				\n"
         :
@@ -253,13 +293,13 @@ int main(void)
         return 20;
     }
 
-    printf("Installed at vector %lu. qcount=%lu\n", vec, qcount);
+    printf("Installed at vector %lu. count=%lu\n", vec, g_state.intcount);
 
-    *ADDR8(a4091_reg_base + A4091_OFFSET_QUICKINT) = (uint8_t)vec;
+    *ADDR8(g_state.base_addr + A4091_OFFSET_QUICKINT) = (uint8_t)vec;
 
     printf("Informed A4091 of quick interrupt vector %lu.\n", vec);
 
-    before = qcount;
+    before = g_state.intcount;
 
     printf("Resetting SCSI host controller (slow).\n");
     a4091_reset();
@@ -291,8 +331,8 @@ int main(void)
     /* Give a little time in case the interrupt is slightly delayed */
     Delay(2);
 
-    after = qcount;
-    printf("After trigger: qcount=%lu (delta=%ld)\n", after, (long)(after - before));
+    after = g_state.intcount;
+    printf("After trigger: intcount=%lu (delta=%ld)\n", after, (long)(after - before));
 
     if (after == before) {
         printf("WARNING: quick interrupt did not fire (counter unchanged).\n");
@@ -302,7 +342,7 @@ int main(void)
 
     printf("Releasing quick interrupt vector %lu...\n", vec);
     ReleaseQuickVector(vec);
-    printf("Released. Final qcount=%lu\n", qcount);
+    printf("Released. Final intcount=%lu\n", g_state.intcount);
 
     return 0;
 }
