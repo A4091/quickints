@@ -341,6 +341,7 @@ int main(void)
     }
 
     printf("Releasing quick interrupt vector %lu...\n", vec);
+    *ADDR8(g_state.base_addr + (A4091_OFFSET_QUICKINT | (1<<17)) ) = 0x0;
     ReleaseQuickVector(vec);
     printf("Released. Final intcount=%lu\n", g_state.intcount);
 
